@@ -1,0 +1,10 @@
+[project]
+name = "maml"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "equinox>=0.13.2",
+    "optax>=0.2.6",
+]
