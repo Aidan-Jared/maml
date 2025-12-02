@@ -35,7 +35,7 @@ class MetaLearner(ABC):
         )
 
         outer_loss, (state, outer_logs) = self.loss(
-            adapted_params, state, train.inputs, train.targets, args
+            adapted_params, state, test.inputs, test.targets, args
         )
 
         return (outer_loss, state, inner_logs, outer_logs)
