@@ -3,8 +3,9 @@ import jax
 import jax.numpy as jnp
 import equinox as eqx
 import tqdm as tqdm
-import random
 from jaxtyping import Array, Float, Int, PyTree
+
+from sampleTask import Sample_Task
 
 from jax_meta.utils.losses import cross_entropy
 from jax_meta.utils.metrics import accuracy
@@ -18,160 +19,151 @@ from functools import partial
 seed = 42
 key = jax.random.PRNGKey(seed)
 
-class Sample_Task:
-    def __init__(self, dataset, key, n_ways=5, k_shot=1, q_query = 15) -> None:
-        self.class_to_indices = {}
+class iMAML:
+    def __init__(
+            self,
+            alpha: Float = .1,
+            lambda_:  Float = 1.,
+            regu_coef: Float = 1.,
+            cg_damping: Float = 10.,
+            cg_steps: Int = 5) -> None:
+        self.alpha = alpha
+        self.lambda_ = lambda_
+        self.regu_coef = regu_coef
+        self.cg_damping = cg_damping
+        self.cg_steps = cg_steps
 
-        for idx, (_, label) in enumerate(dataset):
-            if label not in self.class_to_indices:
-                self.class_to_indices[label] = []
-            self.class_to_indices[label].append(idx)
+    @eqx.filter_jit
+    def loss(self, model: CNN, x: Float[Array, " batch 1 28 28"], y: Int[Array, " batch"]) -> Float[Array, ""]:
+        pred_y = jax.vmap(model)(x)
+        loss = cross_entropy(pred_y, y)
         
-        self.key=key
-        self.n_ways=n_ways
-        self.k_shot=k_shot
-        self.q_query=q_query
+        return jnp.mean(loss)
 
-        self.dataset = dataset
-
-    def sample(self):
-        selected_classes = jax.random.choice(key=self.key, a= jnp.array(list(self.class_to_indices.keys()), dtype=jnp.int32), shape=(1, self.n_ways), replace=False)[0]
-        self.key, _ = jax.random.split(self.key)
-        
-
-        support_data = []
-        query_data = []
-
-        support_target = []
-        query_target = []
-
-        for new_label, original_class in enumerate(selected_classes):
-            indicies = self.class_to_indices[original_class.item()]
-            
-            random.shuffle(indicies)
-
-
-
-            support_data.extend([self.dataset[idx][0].numpy() for idx in indicies[:self.k_shot]])
-            query_data.extend([self.dataset[idx][0].numpy() for idx in indicies[self.k_shot:self.k_shot + self.q_query]])
-
-            support_target.extend([new_label] * self.k_shot)
-            query_target.extend([new_label] * self.q_query)
-        
-        support_set = (jnp.stack(support_data), jnp.stack(support_target))
-        query_set = (jnp.stack(query_data), jnp.stack(query_target))
-    
-        return support_set, query_set
-
-@eqx.filter_jit
-def loss( model: CNN, x: Float[Array, " batch 1 28 28"], y: Int[Array, " batch"]) -> Float[Array, ""]:
-    pred_y = jax.vmap(model)(x)
-    loss = cross_entropy(pred_y, y)
-    
-    return jnp.mean(loss)
-
-@partial(eqx.filter_jit, donate="none")
-def inner_loop(
-        model: CNN,
-        support_set: tuple[Float[Array, "Channels Width Height"], Int],
-        query_set: tuple[Float[Array, "Channels Width Height"], Int],
-        alpha: Float,
-        batch: Int = 5
-):
-    
-    optim = optax.sgd(alpha)
-    opt_state = optim.init(eqx.filter(model, eqx.is_array))
-    
-    def make_step(
-        model, opt_state
+    @partial(eqx.filter_jit, donate="none")
+    def inner_loop(
+            self,
+            model: CNN,
+            support_set: tuple[Float[Array, "Channels Width Height"], Int],
+            batch: Int = 5
     ):
-        loss_value, grads = eqx.filter_value_and_grad(loss)(model, support_set[0], support_set[1])
-        updates, opt_state = optim.update(
-            grads, opt_state, eqx.filter(model, eqx.is_array)
+        
+        gradient_descent = lambda p, p0, g: p - self.alpha * (g + self.lambda_ * (p - p0))
+
+        init_params, static = eqx.partition(model, eqx.is_array)
+
+        def make_step(
+                params,
+                _
+        ):
+            model = eqx.combine(params, static)
+
+            loss_value, grads = eqx.filter_value_and_grad(self.loss)(model, support_set[0], support_set[1])
+
+            params = jax.tree_util.tree_map(gradient_descent, params, init_params, grads)
+
+            return params, loss_value
+        
+        return jax.lax.scan(
+            make_step,
+            init_params,
+            None,
+            length= batch
         )
-        model = eqx.apply_updates(model, updates)
-        return (model, opt_state), loss_value
     
-    inner_losses = []
-    for _ in range(batch):
-        (model, opt_state), inner_loss = make_step(model, opt_state)
-        inner_losses.append(inner_loss)
+    # @eqx.filter_jit
+    def hessian_vector_product(
+            self,
+            params: PyTree,
+            static,
+            support_set: tuple[Float[Array, "Channels Width Height"], Int],
+    ):
+        loss_fn = eqx.filter_grad(self.loss)
+        train_loss = lambda x: loss_fn(eqx.combine(x, static), support_set[0], support_set[1])
+        _, hvp_fn = jax.linearize(train_loss, params)
 
-    outer_loss, outer_grads = eqx.filter_value_and_grad(loss)(model, query_set[0], query_set[1])
+        def _hvp_damping(tangents):
+            damping = lambda h, t: (1. + self.regu_coef) * t + h /(self.lambda_ + self.cg_damping)
+            return jax.tree_util.tree_map(damping, hvp_fn(tangents), tangents)
+        return _hvp_damping
+    
+    @eqx.filter_jit
+    def task_gradient(self, model, static, inner_batch, support_set, query_set, inner_losses, outer_losses):
 
-    del model, opt_state
+        addapted_params, loss_value = self.inner_loop(model, support_set, inner_batch)
 
-    return jnp.mean(jnp.array(inner_losses)), outer_loss, outer_grads
+        inner_losses.append(jnp.mean(loss_value).astype(float))
 
-def train(
-        model: CNN,
-        sampler: Sample_Task,
-        alpha: Float = .05,
-        beta: Float = .001,
-        task_batch: Int = 5,
-        inner_batch: Int = 5,
-        epochs: Int = 100,
-):
-    optim_outer = optax.adamw(beta)
-    opt_state_outer = optim_outer.init(eqx.filter(model, eqx.is_array))
+        outer_loss, outer_grads = eqx.filter_value_and_grad(self.loss)(eqx.combine(addapted_params, static), query_set[0], query_set[1])
+        outer_losses.append(outer_loss.astype(float))
 
-    for epoch in tqdm.tqdm(range(epochs)):
-        accumulated_grads = None
-        inner_losses = []
-        outer_losses = []
-        
-        # Process tasks one at a time to save memory
-        for _ in range(task_batch):
-            support_set, query_set = sampler.sample()
-            
-            # Process single task
-            inner_loss, outer_loss, outer_grads = inner_loop(
-                model, support_set, query_set, alpha, inner_batch
+        hvp_fn = self.hessian_vector_product(
+            addapted_params, static, support_set
+        )
+
+        outer_grads, _ = jax.scipy.sparse.linalg.cg(
+            hvp_fn,
+            outer_grads,
+            maxiter=self.cg_steps
+        )
+
+        del addapted_params, outer_loss
+        return outer_grads, inner_losses, outer_losses
+    
+    def train(
+            self,
+            model: CNN,
+            sampler: Sample_Task,
+            task_batch: Int = 5,
+            inner_batch: Int = 5,
+            epochs: Int = 100,
+
+    ):
+        optim_outer = optax.adamw(self.alpha / 10)
+        opt_state_outer = optim_outer.init(eqx.filter(model, eqx.is_array))
+
+        params, static = eqx.partition(model, eqx.is_array)
+
+        del params
+
+        for epoch in tqdm.tqdm(range(epochs)):
+            inner_losses = []
+            outer_losses = []
+
+            accumulated_grads = []
+
+            for _ in range(task_batch):
+                support_set, query_set = sampler.sample()
+                
+                outer_grads, inner_losses, outer_losses = self.task_gradient(model, static, inner_batch, support_set, query_set, inner_losses, outer_losses)
+                outer_grads = jax.lax.stop_gradient(outer_grads)
+
+                accumulated_grads.append(outer_grads)
+                
+                del outer_grads
+
+            avg_grads = jax.tree_util.tree_map(
+                lambda *grads: jnp.mean(jnp.stack(grads), axis=0),
+                *accumulated_grads
             )
-            
-            # Convert to float immediately to free GPU memory
-            inner_losses.append(float(inner_loss))
-            outer_losses.append(float(outer_loss))
-            
-            # Accumulate gradients
-            if accumulated_grads is None:
-                accumulated_grads = outer_grads
-            else:
-                accumulated_grads = jax.tree_util.tree_map(
-                    lambda acc, new: acc + new,
-                    accumulated_grads,
-                    outer_grads
-                )
-            
-            del outer_grads  # Free memory
-        
-        # Average gradients
-        avg_grads = jax.tree_util.tree_map(
-            lambda g: g / task_batch,
-            accumulated_grads
-        )
-        del accumulated_grads
-        
-        # Update model
-        updates, opt_state_outer = optim_outer.update(
-            avg_grads, opt_state_outer, eqx.filter(model, eqx.is_array)
-        )
-        model = eqx.apply_updates(model, updates)
-        del avg_grads, updates
-        
-        # Log
-        if epoch % 10 == 0:
-            avg_inner = sum(inner_losses) / len(inner_losses)
-            avg_outer = sum(outer_losses) / len(outer_losses)
-            print(f"Epoch {epoch}: Inner Loss = {avg_inner:.4f}, Outer Loss = {avg_outer:.4f}")
-        
-        # Clear cache periodically
-        if epoch % 5 == 0:
-            import gc
-            gc.collect()
 
-    return model
+            del accumulated_grads
 
+            updates, opt_state_outer = optim_outer.update(avg_grads, opt_state_outer, eqx.filter(model, eqx.is_array))
+
+            model = eqx.apply_updates(model, updates=updates)
+            del updates, avg_grads
+
+            if epoch % 10 == 0:
+                avg_inner = sum(inner_losses) / len(inner_losses)
+                avg_outer = sum(outer_losses) / len(outer_losses)
+                print(f"Epoch {epoch}: Inner Loss = {avg_inner:.4f}, Outer Loss = {avg_outer:.4f}")
+        
+            # Clear cache periodically
+            if epoch % 5 == 0:
+                jax.clear_caches()
+        return model
+                
 
 def main():
     normalize_data = torchvision.transforms.Compose(
@@ -196,7 +188,9 @@ def main():
 
     model = CNN(key=key, channels= shape[0], width=shape[1], height=shape[2])
 
-    model = train(model, sampler)
+    maml = iMAML()
+
+    model = maml.train(model, sampler, inner_batch=3)
 
 
 if __name__ == "__main__":
