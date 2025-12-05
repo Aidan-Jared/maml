@@ -20,7 +20,7 @@ class Sample_Task:
 
     def sample(self):
         selected_classes = jax.random.choice(key=self.key, a= jnp.array(list(self.class_to_indices.keys()), dtype=jnp.int32), shape=(1, self.n_ways), replace=False)[0]
-        self.key, _ = jax.random.split(self.key)
+        self.key, key1 = jax.random.split(self.key)
         
 
         support_data = []
@@ -31,10 +31,11 @@ class Sample_Task:
 
         for new_label, original_class in enumerate(selected_classes):
             indicies = self.class_to_indices[original_class.item()]
+
+            indicies = jax.random.choice(key=key1, a=jnp.array(indicies), shape=(1, len(indicies)))[0]
+            key1, _ = jax.random.split(key1)
             
-            random.shuffle(indicies)
-
-
+            # random.shuffle(indicies)
 
             support_data.extend([self.dataset[idx][0].numpy() for idx in indicies[:self.k_shot]])
             query_data.extend([self.dataset[idx][0].numpy() for idx in indicies[self.k_shot:self.k_shot + self.q_query]])
