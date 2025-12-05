@@ -11,6 +11,7 @@ from jax_meta.utils.losses import cross_entropy
 from jax_meta.utils.metrics import accuracy
 
 import torchvision
+from torch import manual_seed
 
 from model.cnn import CNN
 
@@ -19,6 +20,7 @@ from functools import partial
 seed = 42
 key = jax.random.PRNGKey(seed)
 
+manual_seed(seed=seed)
 class iMAML:
     def __init__(
             self,
@@ -71,7 +73,6 @@ class iMAML:
             length= batch
         )
     
-    # @eqx.filter_jit
     def hessian_vector_product(
             self,
             params: PyTree,
@@ -88,14 +89,15 @@ class iMAML:
         return _hvp_damping
     
     @eqx.filter_jit
-    def task_gradient(self, model, static, inner_batch, support_set, query_set, inner_losses, outer_losses):
+    def task_gradient(self, model, inner_batch, support_set, query_set):
+
+        params, static = eqx.partition(model, eqx.is_array)
+        del params
 
         addapted_params, loss_value = self.inner_loop(model, support_set, inner_batch)
 
-        inner_losses.append(jnp.mean(loss_value).astype(float))
 
         outer_loss, outer_grads = eqx.filter_value_and_grad(self.loss)(eqx.combine(addapted_params, static), query_set[0], query_set[1])
-        outer_losses.append(outer_loss.astype(float))
 
         hvp_fn = self.hessian_vector_product(
             addapted_params, static, support_set
@@ -107,8 +109,8 @@ class iMAML:
             maxiter=self.cg_steps
         )
 
-        del addapted_params, outer_loss
-        return outer_grads, inner_losses, outer_losses
+        del addapted_params
+        return outer_grads, jnp.mean(loss_value).astype(float), outer_loss.astype(float)
     
     def train(
             self,
@@ -122,10 +124,6 @@ class iMAML:
         optim_outer = optax.adamw(self.alpha / 10)
         opt_state_outer = optim_outer.init(eqx.filter(model, eqx.is_array))
 
-        params, static = eqx.partition(model, eqx.is_array)
-
-        del params
-
         for epoch in tqdm.tqdm(range(epochs)):
             inner_losses = []
             outer_losses = []
@@ -135,7 +133,9 @@ class iMAML:
             for _ in range(task_batch):
                 support_set, query_set = sampler.sample()
                 
-                outer_grads, inner_losses, outer_losses = self.task_gradient(model, static, inner_batch, support_set, query_set, inner_losses, outer_losses)
+                outer_grads, inner_loss, outer_loss = self.task_gradient(model, inner_batch, support_set, query_set)
+                inner_losses.append(inner_loss)
+                outer_losses.append(outer_loss)
                 outer_grads = jax.lax.stop_gradient(outer_grads)
 
                 accumulated_grads.append(outer_grads)
@@ -160,8 +160,7 @@ class iMAML:
                 print(f"Epoch {epoch}: Inner Loss = {avg_inner:.4f}, Outer Loss = {avg_outer:.4f}")
         
             # Clear cache periodically
-            if epoch % 5 == 0:
-                jax.clear_caches()
+            jax.clear_caches()
         return model
                 
 
@@ -169,6 +168,7 @@ def main():
     normalize_data = torchvision.transforms.Compose(
         [
         torchvision.transforms.ToTensor(),
+        torchvision.transforms.Resize(28),
         torchvision.transforms.Normalize((0.5,), (0.5,)),
         ]
     )
@@ -190,7 +190,7 @@ def main():
 
     maml = iMAML()
 
-    model = maml.train(model, sampler, inner_batch=3)
+    model = maml.train(model, sampler, inner_batch=5, task_batch=3)
 
 
 if __name__ == "__main__":

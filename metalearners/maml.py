@@ -36,23 +36,32 @@ class MAML:
             batch: Int = 5
     ):
         
+
+        params, static = eqx.partition(model, eqx.is_array)
         optim = optax.sgd(alpha)
-        opt_state = optim.init(eqx.filter(model, eqx.is_array))
+        opt_state = optim.init(params)
         
         def make_step(
-            model, opt_state
+            params, opt_state
         ):
+            model = eqx.combine(params, static)
+
             loss_value, grads = eqx.filter_value_and_grad(self.loss)(model, support_set[0], support_set[1])
             updates, opt_state = optim.update(
-                grads, opt_state, eqx.filter(model, eqx.is_array)
+                grads, opt_state, params
             )
-            model = eqx.apply_updates(model, updates)
-            return (model, opt_state), loss_value
+
+            params = eqx.apply_updates(params, updates)
+            return (params, opt_state), loss_value
         
-        inner_losses = []
-        for _ in range(batch):
-            (model, opt_state), inner_loss = make_step(model, opt_state)
-            inner_losses.append(inner_loss)
+        (adapted_params, _), inner_losses = jax.lax.scan(
+            make_step,
+            (params, opt_state),
+            None,
+            length=batch
+        )
+
+        model = eqx.combine(adapted_params, static)
 
         outer_loss, outer_grads = eqx.filter_value_and_grad(self.loss)(model, query_set[0], query_set[1])
 
