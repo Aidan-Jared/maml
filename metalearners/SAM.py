@@ -1,9 +1,7 @@
 import jax
 import jax.numpy as jnp
 import optax
-from jaxtyping import Float, Int, Array, PyTree, Bool
-
-import equinox as eqx
+from jaxtyping import Float, PyTree, Bool
 
 class SAM:
     def __init__(
