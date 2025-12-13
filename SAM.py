@@ -9,15 +9,16 @@ from torchvision import datasets, transforms
 from torch import manual_seed
 import equinox as eqx
 
-from sampleTask import Sample_Task
+from sampleTask import FCS_loader
 from model.cnn import CNN
 
 from functools import partial
 import tqdm as tqdm
 
-seed = 42
-key = jax.random.PRNGKey(seed)
-manual_seed(seed)
+
+SEED = 42
+KEY = jax.random.PRNGKey(SEED)
+manual_seed(SEED)
 
 class SAM:
     def __init__(
@@ -80,65 +81,88 @@ def loss( model: CNN, x: Float[Array, " batch 1 28 28"], y: Int[Array, " batch"]
 
 def train(
         model: CNN,
-        sampler: Sample_Task,
-        epochs: Int = 100,
-        task_batch: Int = 3
+        sampler: FCS_loader,
+        optim: optax.GradientTransformationExtraArgs,
+        iterations: Int = 100,
+        rho: Float = .01
 ) -> CNN:
-    optim = optax.sgd(1e-4)
     opt_state = optim.init(eqx.filter(model, eqx.is_array))
 
-    sam = SAM(optim)
+    sam = SAM(optim, rho)
 
     @eqx.filter_jit
-    def step(model: CNN, sample_set: tuple[Float[Array, " batch 1 28 28"], Float[Array, " batch"]], opt_state: PyTree):
-        (loss_value, acc), grads = eqx.filter_value_and_grad(loss, has_aux=True)(model, support_set[0], support_set[1])
+    def step(model: CNN, X: Float[Array, " batch 1 28 28"], y: Float[Array, " batch"], opt_state: PyTree):
+        (loss_value, acc), grads = eqx.filter_value_and_grad(loss, has_aux=True)(model, X, y)
 
         params, static = eqx.partition(model, eqx.is_array)
         params, p_params = sam.apply_pertibation(params, grads)
 
         p_model = eqx.combine(p_params, static)
-        (p_loss_value, p_acc), grads = eqx.filter_value_and_grad(loss, has_aux=True)(p_model, support_set[0], support_set[1])
+        (p_loss_value, p_acc), grads = eqx.filter_value_and_grad(loss, has_aux=True)(p_model, X, y)
 
         updates, opt_state = sam.update(grads, opt_state, params)
         model = eqx.apply_updates(model, updates)
-        return model, loss_value, acc, p_loss_value, p_acc
+        return model, opt_state, loss_value, acc, p_loss_value, p_acc
 
 
 
-    for epoch in tqdm.tqdm(range(epochs)):
-        train_losses = []
-        train_acces = []
-        p_train_losses = []
-        p_train_acces = []
+    train_losses = []
+    train_acces = []
+    p_train_losses = []
+    p_train_acces = []
 
-        test_losses = []
-        test_acces = []
+    test_losses = []
+    test_acces = []
+
+    pbar = tqdm.tqdm(range(iterations))
+    for iter in pbar:
     
+        support_set, query_set = sampler.sample_batch()
+        support_x = support_set[0].reshape(-1, *support_set[0].shape[2:])
+        support_y = support_set[1].reshape(-1)
 
-        for _ in range(task_batch):
-            support_set, query_set = sampler.sample()
-            model, loss_value, acc, p_loss_value, p_acc = step(model, support_set, opt_state)
-            train_losses.append(loss_value)
-            p_train_losses.append(p_loss_value)
-            train_acces.append(acc)
-            p_train_acces.append(p_acc)
-        
-            val_loss, val_acc = eqx.filter_jit(loss)(model, query_set[0], query_set[1])
-            test_losses.append(val_loss)
-            test_acces.append(val_acc)
+        query_x = query_set[0].reshape(-1, *query_set[0].shape[2:])
+        query_y = query_set[1].reshape(-1)
 
-        if (epoch + 1) % 10 == 0:
+
+        model, opt_state, loss_value, acc, p_loss_value, p_acc = step(model, support_x, support_y, opt_state)
+        train_losses.append(loss_value.item())
+        p_train_losses.append(p_loss_value.item())
+        train_acces.append(acc.item())
+        p_train_acces.append(p_acc.item())
+    
+        val_loss, val_acc = eqx.filter_jit(loss)(model, query_x, query_y)
+        test_losses.append(val_loss.item())
+        test_acces.append(val_acc.item())
+
+        if (iter + 1) % 10 == 0:
             avg_train_loss = sum(train_losses) / len(train_losses)
             avg_train_acc = sum(train_acces) / len(train_acces)
             avg_p_train_loss = sum(p_train_losses) / len(p_train_losses)
             avg_p_train_acc = sum(p_train_acces) / len(p_train_acces)
             avg_val_loss = sum(test_losses) / len(test_losses)
-            avg_val_acces = sum(test_acces) / len(test_acces)
-            print(f"Epoch {epoch + 1}: train loss = {avg_train_loss:.4f}, train acc = {avg_train_acc:.4f}")
-            print(f"p_train loss = {avg_p_train_loss:.4f}, p_train acc = {avg_p_train_acc:.4f}")
-            print(f"val loss = {avg_val_loss:.4f}, val acc = {avg_val_acces:.4f}")
+            avg_val_acc = sum(test_acces) / len(test_acces)
 
+            pbar.set_postfix({
+                "Iter" : f'{iter + 1}',
+                "train loss" : f'{avg_train_loss:.4f}',
+                "train acc" : f'{avg_train_acc:.4f}',
+                "p_train loss" : f'{avg_p_train_loss:.4f}',
+                "p_train acc" : f'{avg_p_train_acc:.4f}',
+                "val loss" : f'{avg_val_loss:.4f}',
+                "val acc" : f'{avg_val_acc:.4f}'
+            })
 
+            # print(f"Iter {iter + 1}: train loss = {avg_train_loss:.4f}, train acc = {avg_train_acc:.4f}")
+            # print(f"p_train loss = {avg_p_train_loss:.4f}, p_train acc = {avg_p_train_acc:.4f}")
+            # print(f"val loss = {avg_val_loss:.4f}, val acc = {avg_val_acc:.4f}")
+            train_losses = []
+            train_acces = []
+            p_train_losses = []
+            p_train_acces = []
+
+            test_losses = []
+            test_acces = []
 
     return model
     
@@ -159,17 +183,17 @@ def main():
         background=True
     )
 
-    sampler = Sample_Task(dataset, key, n_ways=n_way, k_shot=1, q_query=15)
+    key, subkey = jax.random.split(KEY)
 
-    sampler.sample()
+    sampler = FCS_loader(dataset, key, batch_size=16, n_ways=5, k_shot=1, q_query=5)
 
     shape = dataset[0][0].shape
-    model = CNN(key=key, channels= shape[0], width=shape[1], height=shape[2], n_way = n_way)
+    model = CNN(key=subkey, channels= shape[0], width=shape[1], height=shape[2], n_way = n_way)
 
-    model = train(model,  sampler)
+    lr = 1e-3
+    optim = optax.sgd(learning_rate=lr)
 
-    
-
+    model = train(model, sampler, optim)
     
 if __name__ == "__main__":
     main()

@@ -17,6 +17,9 @@ from model.cnn import CNN
 
 from functools import partial
 
+import os
+os.environ['JAX_PLATFORMS'] = 'cpu'
+
 seed = 42
 key = jax.random.PRNGKey(seed)
 
