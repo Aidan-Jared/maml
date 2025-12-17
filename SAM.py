@@ -36,7 +36,7 @@ class SAM:
         self.rho = rho
         self.adaptive = adaptive
 
-    eqx.filter_jit
+    @eqx.filter_jit
     def apply_pertibation(self,
                    params : PyTree,
                    grads : PyTree
@@ -44,6 +44,7 @@ class SAM:
         
         grad_norm = self._grad_norm(params, grads)
         scale = self.rho / (grad_norm + 1e-12)
+        # jax.debug.breakpoint()
         
         def _epsilon(param, grad):
             
@@ -53,7 +54,7 @@ class SAM:
         p_params = jax.tree_util.tree_map(_epsilon, params, grads)
         return p_params
     
-    eqx.filter_jit
+    @eqx.filter_jit
     def update(
             self,
             grads: PyTree,
@@ -69,14 +70,14 @@ class SAM:
             grads : PyTree
     ):
         def _norm(param, grad):
-            return optax.tree.norm((jnp.abs(param) if self.adaptive else 1.0) * grad)
+            return jnp.linalg.norm((jnp.abs(param) if self.adaptive else 1.0) * grad)
         
         norm = jax.tree_util.tree_map(_norm, params, grads)
 
-        return optax.tree.norm(norm)
+        return jnp.linalg.norm(jnp.stack(jax.tree_util.tree_leaves(norm)))
 
 def loss( model: CNN, x: Float[Array, " task 1 28 28"], y: Int[Array, " task"], key) -> tuple[Float[Array, ""], Float]:
-    pred_y = jax.vmap(model, in_axes=(0, None))(x, key)
+    pred_y = jax.vmap(model, in_axes=(0, None), axis_name="batch")(x, key)
     loss = jnp.mean(cross_entropy(pred_y, y))
     acc = accuracy(pred_y, y)
     return (loss, acc)
@@ -96,20 +97,22 @@ def train(
     @eqx.filter_jit
     def step(model: CNN, X: Float[Array, " batch task 1 28 28"], y: Float[Array, " batch task"], opt_state: PyTree, key):
         gloss = eqx.filter_value_and_grad(loss, has_aux=True)
-        (loss_value, acc), grads = eqx.filter_vmap(gloss,in_axes=(None, 0, 0, None))(model, X, y, key)
+        key, *subkeys = jax.random.split(key, X.shape[0]+1)
+        keys_array = jnp.stack(subkeys)
+        (loss_value, acc), grads = eqx.filter_vmap(gloss,in_axes=(None, 0, 0, 0))(model, X, y, keys_array)
 
         avg_grads = jax.tree.map(lambda g: jnp.mean(g, axis=0), grads)
         params, static = eqx.partition(model, eqx.is_array)
         p_params = sam.apply_pertibation(params, avg_grads)
 
         p_model = eqx.combine(p_params, static)
-        (p_loss_value, p_acc), grads = eqx.filter_vmap(gloss,in_axes=(None, 0, 0, None))(p_model, X, y, key)
+        (p_loss_value, p_acc), grads = eqx.filter_vmap(gloss,in_axes=(None, 0, 0, 0))(p_model, X, y, keys_array)
 
         avg_grads = jax.tree.map(lambda g: jnp.mean(g, axis=0), grads)
 
         updates, opt_state = sam.update(avg_grads, opt_state, params)
         model = eqx.apply_updates(model, updates)
-        return model, opt_state, jnp.mean(loss_value), jnp.mean(acc), jnp.mean(p_loss_value), jnp.mean(p_acc)
+        return model, opt_state, jnp.mean(loss_value), jnp.mean(acc), jnp.mean(p_loss_value), jnp.mean(p_acc), key
 
 
 
@@ -122,7 +125,6 @@ def train(
     test_acces = []
 
     pbar = tqdm.tqdm(range(iterations))
-    vloss = eqx.filter_vmap(loss, in_axes=(None, 0,0, None))
     for iter in pbar:
     
         support_set, query_set = sampler.sample_batch()
@@ -132,14 +134,15 @@ def train(
         query_x = query_set[0]#.reshape(-1, *query_set[0].shape[2:])
         query_y = query_set[1]#.reshape(-1)
         model = eqx.nn.inference_mode(model, value=False)
-        model, opt_state, loss_value, acc, p_loss_value, p_acc = step(model, support_x, support_y, opt_state, key)
+        model, opt_state, loss_value, acc, p_loss_value, p_acc, key = step(model, support_x, support_y, opt_state, key)
         train_losses.append(loss_value.item())
         p_train_losses.append(p_loss_value.item())
         train_acces.append(acc.item())
         p_train_acces.append(p_acc.item())
 
         model = eqx.nn.inference_mode(model, value=True)
-        val_loss, val_acc = eqx.filter_jit(vloss)(model, query_x, query_y, key)
+        vloss = eqx.filter_vmap(loss, in_axes=(None, 0,0, None))
+        val_loss, val_acc = eqx.filter_jit(vloss)(model, query_x, query_y, None)
         test_losses.append(jnp.mean(val_loss).item())
         test_acces.append(jnp.mean(val_acc).item())
 
@@ -182,10 +185,9 @@ def main():
     normalize_data = transforms.Compose(
         [
         transforms.ToTensor(),
-        transforms.Resize(32),
-        transforms.RandomRotation((-180,180)),
-        transforms.ColorJitter(),
-        transforms.Normalize((0.5,), (0.5,)),
+        transforms.Resize(84),
+        transforms.RandomRotation(15),
+        # transforms.Normalize((0.5,), (0.5,)),
         ]
     )
 
@@ -201,12 +203,12 @@ def main():
     sampler = FCS_loader(dataset, key, batch_size=8, n_ways=5, k_shot=1, q_query=15)
 
     shape = dataset[0][0].shape
-    model = CNN(key=subkey1, channels= shape[0], width=shape[1], height=shape[2], n_way = n_way)
+    model = CNN(key=subkey1, channels= shape[0], width=shape[1], height=shape[2], n_way = n_way, dropout=0.1)
 
     lr = 3e-2
     optim = optax.sgd(learning_rate=lr)
 
-    model = train(model, sampler, optim, subkey2, iterations=int(5e4))
+    model = train(model, sampler, optim, subkey2, iterations=int(5e4), rho=.2)
     
 if __name__ == "__main__":
     main()
