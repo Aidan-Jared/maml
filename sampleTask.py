@@ -158,7 +158,8 @@ class FCS_loader:
     
     def sample_batch(
             self,
-            device:str = 'gpu'
+            device:str = 'gpu',
+
     )-> tuple[tuple[Array, Array], tuple[Array, Array]]:
         self.key, *subkeys = jax.random.split(self.key, self.batch_size + 1)
 
