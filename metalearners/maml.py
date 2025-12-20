@@ -11,7 +11,7 @@ from jaxtyping import Array, Float, Int, PyTree
 
 from functools import partial
 
-from sampleTask import Sample_Task
+from sampleTask import FCS_loader
 
 class MAML:
     def __init__(
@@ -72,7 +72,7 @@ class MAML:
     def train(
             self,
             model: CNN,
-            sampler: Sample_Task,
+            sampler: FCS_loader,
             alpha: Float = .05,
             beta: Float = .001,
             task_batch: Int = 5,

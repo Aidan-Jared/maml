@@ -145,7 +145,7 @@ class FCS_loader:
             all_data = jax.device_put(all_data, device)
             all_labels = jax.device_put(all_labels, device)
         
-        data_reshaped = all_data.reshpe(self.n_ways, self.samples_per_class, *all_data.shape[1:])
+        data_reshaped = all_data.reshape(self.n_ways, self.samples_per_class, *all_data.shape[1:])
         labels_reshaped = all_labels.reshape(self.n_ways, self.samples_per_class)
 
         support_data = data_reshaped[:,:self.k_shot].reshape(-1, *all_data.shape[1:])

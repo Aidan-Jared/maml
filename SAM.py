@@ -12,7 +12,6 @@ import equinox as eqx
 from sampleTask import FCS_loader
 from model.cnn import CNN
 
-from functools import partial
 import tqdm as tqdm
 
 import os
@@ -88,7 +87,8 @@ def train(
         optim: optax.GradientTransformationExtraArgs,
         key,
         iterations: Int = 100,
-        rho: Float = .01
+        rho: Float = .01,
+        steps: Int = 5
 ) -> CNN:
     opt_state = optim.init(eqx.filter(model, eqx.is_array))
 
@@ -134,11 +134,12 @@ def train(
         query_x = query_set[0]#.reshape(-1, *query_set[0].shape[2:])
         query_y = query_set[1]#.reshape(-1)
         model = eqx.nn.inference_mode(model, value=False)
-        model, opt_state, loss_value, acc, p_loss_value, p_acc, key = step(model, support_x, support_y, opt_state, key)
-        train_losses.append(loss_value.item())
-        p_train_losses.append(p_loss_value.item())
-        train_acces.append(acc.item())
-        p_train_acces.append(p_acc.item())
+        for _ in range(steps):
+            model, opt_state, loss_value, acc, p_loss_value, p_acc, key = step(model, support_x, support_y, opt_state, key)
+            train_losses.append(loss_value.item())
+            p_train_losses.append(p_loss_value.item())
+            train_acces.append(acc.item())
+            p_train_acces.append(p_acc.item())
 
         model = eqx.nn.inference_mode(model, value=True)
         vloss = eqx.filter_vmap(loss, in_axes=(None, 0,0, None))
@@ -200,7 +201,16 @@ def main():
 
     key, subkey1, subkey2 = jax.random.split(KEY, 3)
 
-    sampler = FCS_loader(dataset, key, batch_size=8, n_ways=5, k_shot=1, q_query=15)
+    sampler = FCS_loader(dataset, key, batch_size=4, n_ways=5, k_shot=1, q_query=15)
+
+    shape = dataset[0][0].shape
+    model = CNN(key=subkey1, channels= shape[0], width=shape[1], height=shape[2], n_way = n_way, dropout=0.1)
+
+    lr = 3e-2
+    optim = optax.sgd(learning_rate=lr)
+    key, subkey1, subkey2 = jax.random.split(KEY, 3)
+
+    sampler = FCS_loader(dataset, key, batch_size=4, n_ways=5, k_shot=1, q_query=15)
 
     shape = dataset[0][0].shape
     model = CNN(key=subkey1, channels= shape[0], width=shape[1], height=shape[2], n_way = n_way, dropout=0.1)
@@ -208,7 +218,7 @@ def main():
     lr = 3e-2
     optim = optax.sgd(learning_rate=lr)
 
-    model = train(model, sampler, optim, subkey2, iterations=int(5e4), rho=.2)
+    model = train(model, sampler, optim, subkey2, iterations=int(5e4), rho=.01)
     
 if __name__ == "__main__":
     main()
